@@ -3,11 +3,19 @@ _target_: topobench.model.TBModel
 model_name: topotune
 model_domain: combinatorial
 tune_gnn: GCN
+inter_level_aggregation: null # Can be either null or PyGAggregationAdapter
+
+#inter_level_aggregation:
+#  _target_: topobench.nn.inter_level_aggregation.PyGAggregationAdapter
+#  aggregation:
+#    _target_: torch_geometric.nn.aggr.GRUAggregation
+#    in_channels: ${model.feature_encoder.out_channels}
+#    out_channels: ${model.feature_encoder.out_channels}
 
 feature_encoder:
   _target_: topobench.nn.encoders.${model.feature_encoder.encoder_name}
   encoder_name: AllCellFeatureEncoder
-  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}} 
+  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}}
   out_channels: 32
   proj_dropout: 0.
   selected_dimensions:
@@ -33,6 +41,7 @@ backbone:
   layers: 2
   use_edge_attr: false
   activation: relu
+  inter_level_aggregation: ${model.inter_level_aggregation}
 
 backbone_wrapper:
   _target_: topobench.nn.wrappers.combinatorial.TuneWrapper

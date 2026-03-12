@@ -168,7 +168,13 @@ def test_topotune_methods():
     batch = create_mock_complex_batch()
     gnn = MockGNN(16, 32, 16)
     neighborhoods = OmegaConf.create(["up_adjacency-0", "down_incidence-1"])#[[[0, 0], "adjacency"], [[1, 0], "boundary"]])
-    topotune = TopoTune(GNN=gnn, neighborhoods=neighborhoods, layers=2, use_edge_attr=False, activation="relu")
+    topotune = TopoTune(
+        GNN=gnn, 
+        neighborhoods=neighborhoods, 
+        layers=2, 
+        use_edge_attr=False, 
+        activation="relu", 
+    )
 
     # Test generate_membership_vectors
     membership = topotune.generate_membership_vectors(batch)
@@ -206,7 +212,8 @@ def test_topotune_methods():
 
     # Test aggregate_inter_nbhd
     x_out_per_route = {0: torch.randn(3, 16), 1: torch.randn(3, 16)}
-    aggregated = topotune.aggregate_inter_nbhd(x_out_per_route)
+    aggregated = topotune.aggregate_inter_nbhd(x_out_per_route, layer_idx=0)
+    print(aggregated)
     assert 0 in aggregated
     assert aggregated[0].shape == (3, 16)
 
@@ -376,4 +383,3 @@ def test_topotune_src_rank_larger_than_dst_rank():
     for rank in [0, 1, 2]:
         assert rank in output
         assert output[rank].shape == getattr(batch, f"x_{rank}").shape
-

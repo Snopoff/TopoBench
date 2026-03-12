@@ -26,6 +26,12 @@ class TopoTune(torch.nn.Module):
         Whether to use edge attributes.
     activation : str
         The activation function to use. ex: 'relu', 'tanh', 'sigmoid'.
+    rank_to_propagate : int, optional
+        Extra rank to include in the final output dictionary even if no route
+        targets it.
+    inter_level_aggregation : torch.nn.Module or None, optional
+        Inter-level aggregation module applied per destination rank. If
+        ``None``, TopoTune uses the legacy rank-wise sum path.
     """
 
     def __init__(
@@ -35,18 +41,25 @@ class TopoTune(torch.nn.Module):
         layers,
         use_edge_attr,
         activation,
-        rank_to_propagate,
+        rank_to_propagate: int | None = None,
+        inter_level_aggregation: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.routes = get_routes_from_neighborhoods(neighborhoods)
         self.neighborhoods = neighborhoods
         self.layers = layers
         self.use_edge_attr = use_edge_attr
+        self.inter_level_aggregation = inter_level_aggregation
         routes_max_rank = max([max(route) for route in self.routes])
-        self.max_rank = routes_max_rank if rank_to_propagate is None else max(routes_max_rank, rank_to_propagate)
+        self.max_rank = (
+            routes_max_rank
+            if rank_to_propagate is None
+            else max(routes_max_rank, rank_to_propagate)
+        )
         self.graph_routes = torch.nn.ModuleList()
         self.GNN = [i for i in GNN.named_modules()]
         self.activation = activation
+        self.route_indices_by_dst_rank = self._get_route_indices_by_dst_rank()
         # Instantiate GNN layers
         num_routes = len(self.routes)
         for _ in range(self.layers):
@@ -57,6 +70,52 @@ class TopoTune(torch.nn.Module):
 
         self.hidden_channels = GNN.hidden_channels
         self.out_channels = GNN.out_channels
+        self.inter_level_aggregation_layers = (
+            self._build_inter_level_aggregation_layers()
+        )
+
+    def _get_route_indices_by_dst_rank(self) -> dict[int, list[int]]:
+        """Group route indices by destination rank while preserving config order.
+
+        Returns
+        -------
+        dict[int, list[int]]
+            Mapping from destination rank to the ordered list of route indices
+            that contribute to it.
+        """
+        route_indices_by_dst_rank = {}
+        for route_index, (_, dst_rank) in enumerate(self.routes):
+            route_indices_by_dst_rank.setdefault(dst_rank, []).append(
+                route_index
+            )
+        return route_indices_by_dst_rank
+
+    def _build_inter_level_aggregation_layers(
+        self,
+    ) -> torch.nn.ModuleList | None:
+        """Instantiate one inter-level aggregation module per TopoTune layer.
+
+        Returns
+        -------
+        torch.nn.ModuleList or None
+            One deep-copied aggregation module per TopoTune layer, or ``None``
+            when the legacy sum path is active.
+        """
+        if (
+            self.inter_level_aggregation is None
+        ):  # if None, then we use the legacy sum path and don't need to instantiate any module
+            return None
+        if not isinstance(self.inter_level_aggregation, torch.nn.Module):
+            raise TypeError(
+                "inter_level_aggregation must be either None for the legacy sum path or an instantiated torch.nn.Module."
+            )
+
+        return torch.nn.ModuleList(
+            [
+                copy.deepcopy(self.inter_level_aggregation)
+                for _ in range(self.layers)
+            ]
+        )
 
     def get_nbhd_cache(self, params):
         """Cache the nbhd information into a dict for the complex at hand.
@@ -223,21 +282,49 @@ class TopoTune(torch.nn.Module):
         out = expanded_out[:n_dst_cells]
         return out
 
-    def aggregate_inter_nbhd(self, x_out_per_route):
-        """Aggregate the outputs of the GNN for each rank.
-
-        While the GNN takes care of intra-nbhd aggregation,
-        this will take care of inter-nbhd aggregation.
-        Default: sum.
+    def _build_rank_sequences(
+        self, x_out_per_route: dict[int, torch.Tensor]
+    ) -> dict[int, torch.Tensor]:
+        """Stack route outputs into ordered per-rank sequences.
 
         Parameters
         ----------
-        x_out_per_route : dict
+        x_out_per_route : dict[int, torch.Tensor]
+            Route-wise GNN outputs keyed by route index.
+
+        Returns
+        -------
+        dict[int, torch.Tensor]
+            Mapping from destination rank to either a single route tensor with
+            shape ``[N, C]`` or a stacked route tensor with shape ``[N, T, C]``.
+        """
+        rank_sequences = {}
+        for dst_rank, route_indices in self.route_indices_by_dst_rank.items():
+            if len(route_indices) == 1:
+                rank_sequences[dst_rank] = x_out_per_route[route_indices[0]]
+            else:
+                rank_sequences[dst_rank] = torch.stack(
+                    [
+                        x_out_per_route[route_index]
+                        for route_index in route_indices
+                    ],
+                    dim=1,
+                )
+        return rank_sequences
+
+    def _aggregate_inter_nbhd_sum(
+        self, x_out_per_route: dict[int, torch.Tensor]
+    ) -> dict[int, torch.Tensor]:
+        """Legacy method to aggregate the outputs of the GNN for each rank using a simple sum.
+
+        Parameters
+        ----------
+        x_out_per_route : dict[int, torch.Tensor]
             The outputs of the GNN for each route.
 
         Returns
         -------
-        dict
+        dict[int, torch.Tensor]
             The aggregated outputs of the GNN for each rank.
         """
         x_out_per_rank = {}
@@ -247,6 +334,81 @@ class TopoTune(torch.nn.Module):
             else:
                 x_out_per_rank[dst_rank] += x_out_per_route[route_index]
         return x_out_per_rank
+
+    def _aggregate_inter_nbhd_module(
+        self, x_out_per_route: dict[int, torch.Tensor], layer_idx: int
+    ) -> dict[int, torch.Tensor]:
+        """Aggregate route outputs with an inter-level aggregation module.
+
+        Parameters
+        ----------
+        x_out_per_route : dict[int, torch.Tensor]
+            Route-wise GNN outputs keyed by route index.
+        layer_idx : int
+            Index of the TopoTune layer whose inter-level aggregation module
+            should be used.
+
+        Returns
+        -------
+        dict[int, torch.Tensor]
+            Aggregated outputs keyed by destination rank.
+        """
+        inter_level_aggregation = self.inter_level_aggregation_layers[
+            layer_idx
+        ]
+        rank_sequences = self._build_rank_sequences(x_out_per_route)
+        x_out_per_rank = {}
+
+        for dst_rank, route_indices in self.route_indices_by_dst_rank.items():
+            if len(route_indices) == 1:
+                x_out_per_rank[dst_rank] = x_out_per_route[route_indices[0]]
+            else:
+                route_sequence = rank_sequences[dst_rank]
+                aggregated = inter_level_aggregation(route_sequence)
+                expected_shape = x_out_per_route[route_indices[0]].shape
+                if aggregated.shape != expected_shape:
+                    raise ValueError(
+                        "inter_level_aggregation must return a tensor with the same "
+                        "shape as a single route output. "
+                        f"Expected {tuple(expected_shape)}, received "
+                        f"{tuple(aggregated.shape)}."
+                    )
+                x_out_per_rank[dst_rank] = aggregated
+
+        return x_out_per_rank
+
+    def aggregate_inter_nbhd(
+        self,
+        x_out_per_route: dict[int, torch.Tensor],
+        layer_idx: int | None = None,
+    ) -> dict[int, torch.Tensor]:
+        """Aggregate the outputs of the GNN for each rank.
+
+        While the GNN takes care of intra-nbhd aggregation,
+        this will take care of inter-nbhd aggregation.
+
+        Parameters
+        ----------
+        x_out_per_route : dict[int, torch.Tensor]
+            The outputs of the GNN for each route.
+
+        layer_idx : int | None
+            The index of the layer, used to select the inter-level aggregation module if applicable.
+
+        Returns
+        -------
+        dict[int, torch.Tensor]
+            The aggregated outputs of the GNN for each rank.
+        """
+        if (
+            self.inter_level_aggregation is None
+        ):  # legacy sum path that doesn't use any module
+            return self._aggregate_inter_nbhd_sum(x_out_per_route)
+        if layer_idx is None:
+            raise ValueError(
+                "layer_idx is required for module-based inter-level aggregation."
+            )
+        return self._aggregate_inter_nbhd_module(x_out_per_route, layer_idx)
 
     def generate_membership_vectors(self, batch: Data):
         """Generate membership vectors based on batch.cell_statistics.
@@ -325,7 +487,9 @@ class TopoTune(torch.nn.Module):
                     x_out_per_route[route_index] = x_out
 
             # aggregate across neighborhoods
-            x_out_per_rank = self.aggregate_inter_nbhd(x_out_per_route)
+            x_out_per_rank = self.aggregate_inter_nbhd(
+                x_out_per_route, layer_idx=layer_idx
+            )
 
             # update and replace the features for next layer
             for rank in x_out_per_rank:
