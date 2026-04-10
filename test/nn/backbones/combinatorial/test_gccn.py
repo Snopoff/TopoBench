@@ -1,12 +1,23 @@
 """Unit tests for TopoTune."""
 
+import hydra
 import pytest
+import rootutils
 import torch
-from torch_geometric.data import Data
-from test._utils.nn_module_auto_test import NNModuleAutoTest
-from topobench.nn.backbones.combinatorial.gccn import TopoTune, interrank_boundary_index, get_activation
-from torch_geometric.nn import GCNConv
 from omegaconf import OmegaConf
+from test._utils.nn_module_auto_test import NNModuleAutoTest
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+from torch_geometric.nn.aggr import SumAggregation
+
+from topobench.nn.backbones.combinatorial.gccn import (
+    TopoTune,
+    get_activation,
+    interrank_boundary_index,
+)
+from topobench.nn.inter_level_aggregation import PyGAggregationAdapter
+
+ROOT = rootutils.find_root(__file__, indicator=".project-root")
 
 class MockGNN(torch.nn.Module):
     """Mock GNN module for testing purposes.
@@ -44,8 +55,65 @@ class MockGNN(torch.nn.Module):
         """
         return self.conv(x, edge_index)
 
-def create_mock_complex_batch():
+
+class OrderedRouteMockGNN(torch.nn.Module):
+    """Deterministic route-local update used to test ordered execution.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    hidden_channels : int
+        Number of hidden channels.
+    out_channels : int
+        Number of output channels.
+    dst_scale : float, optional
+        Multiplicative factor applied to the current features before the
+        source-driven accumulation is added.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels,
+        out_channels,
+        dst_scale: float = 2.0,
+    ):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        self.out_channels = out_channels
+        self.dst_scale = dst_scale
+
+    def forward(self, x, edge_index):
+        """Scale current features and add source features onto edge_index[0].
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input node features for the temporary route graph.
+        edge_index : torch.Tensor
+            Route graph connectivity where source features are accumulated into
+            the destination rows.
+
+        Returns
+        -------
+        torch.Tensor
+            Updated node features after deterministic accumulation.
+        """
+        out = self.dst_scale * x.clone()
+        aggregated = torch.zeros_like(x)
+        if edge_index.numel() > 0:
+            aggregated.index_add_(0, edge_index[0], x[edge_index[1]])
+        return out + aggregated
+
+
+def create_mock_complex_batch(hidden_dim: int = 16):
     """Create a mock complex batch for testing.
+
+    Parameters
+    ----------
+    hidden_dim : int, optional
+        Feature dimension used for all ranks in the synthetic complex.
 
     Returns
     -------
@@ -53,9 +121,9 @@ def create_mock_complex_batch():
         A PyTorch Geometric Data object representing a mock complex batch.
     """
     # 3 nodes, 3 edges, 1 face
-    x_0 = torch.randn(3, 16)  # 3 nodes
-    x_1 = torch.randn(3, 16)  # 3 edges
-    x_2 = torch.randn(1, 16)  # 1 face
+    x_0 = torch.randn(3, hidden_dim)  # 3 nodes
+    x_1 = torch.randn(3, hidden_dim)  # 3 edges
+    x_2 = torch.randn(1, hidden_dim)  # 1 face
     
     batch = Data(x_0=x_0, x_1=x_1, x_2=x_2)
 
@@ -383,3 +451,126 @@ def test_topotune_src_rank_larger_than_dst_rank():
     for rank in [0, 1, 2]:
         assert rank in output
         assert output[rank].shape == getattr(batch, f"x_{rank}").shape
+
+
+def test_topotune_sequential_route_order_propagates_across_ranks():
+    """Sequential routing should expose earlier route outputs to later ranks."""
+    batch_a = create_mock_complex_batch(hidden_dim=1)
+    batch_b = create_mock_complex_batch(hidden_dim=1)
+    for batch in (batch_a, batch_b):
+        batch.x_0 = torch.zeros_like(batch.x_0)
+        batch.x_1 = torch.zeros_like(batch.x_1)
+        batch.x_2 = torch.ones_like(batch.x_2)
+
+    model_a = TopoTune(
+        GNN=OrderedRouteMockGNN(1, 1, 1),
+        neighborhoods=OmegaConf.create(
+            ["down_incidence-2", "down_incidence-1"]
+        ),
+        layers=1,
+        use_edge_attr=False,
+        activation="id",
+        route_execution_mode="sequential",
+    )
+    model_b = TopoTune(
+        GNN=OrderedRouteMockGNN(1, 1, 1),
+        neighborhoods=OmegaConf.create(
+            ["down_incidence-1", "down_incidence-2"]
+        ),
+        layers=1,
+        use_edge_attr=False,
+        activation="id",
+        route_execution_mode="sequential",
+    )
+
+    out_a = model_a(batch_a)
+    out_b = model_b(batch_b)
+
+    assert torch.allclose(out_a[0], torch.full((3, 1), 2.0))
+    assert torch.allclose(out_b[0], torch.zeros(3, 1))
+    assert not torch.allclose(out_a[0], out_b[0])
+
+
+def test_topotune_sequential_route_order_refines_same_destination_rank():
+    """Sequential routing should let later inter-rank routes read current x_dst."""
+    batch_a = create_mock_complex_batch(hidden_dim=1)
+    batch_b = create_mock_complex_batch(hidden_dim=1)
+    for batch in (batch_a, batch_b):
+        batch.x_0 = torch.tensor([[1.0], [2.0], [4.0]])
+        batch.x_1 = torch.zeros_like(batch.x_1)
+        batch.x_2 = torch.tensor([[10.0]])
+        batch["up_incidence-0"] = (
+            batch["down_incidence-1"].transpose(0, 1).coalesce()
+        )
+
+    model_a = TopoTune(
+        GNN=OrderedRouteMockGNN(1, 1, 1),
+        neighborhoods=OmegaConf.create(
+            ["up_incidence-0", "down_incidence-2"]
+        ),
+        layers=1,
+        use_edge_attr=False,
+        activation="id",
+        route_execution_mode="sequential",
+    )
+    model_b = TopoTune(
+        GNN=OrderedRouteMockGNN(1, 1, 1),
+        neighborhoods=OmegaConf.create(
+            ["down_incidence-2", "up_incidence-0"]
+        ),
+        layers=1,
+        use_edge_attr=False,
+        activation="id",
+        route_execution_mode="sequential",
+    )
+
+    out_a = model_a(batch_a)
+    out_b = model_b(batch_b)
+
+    assert torch.allclose(out_a[1], torch.tensor([[16.0], [22.0], [20.0]]))
+    assert torch.allclose(out_b[1], torch.tensor([[23.0], [26.0], [25.0]]))
+    assert not torch.allclose(out_a[1], out_b[1])
+
+
+def test_topotune_sequential_mode_rejects_inter_level_aggregation():
+    """Sequential execution and inter-level aggregation should not be mixed."""
+    with pytest.raises(
+        ValueError,
+        match=(
+            "inter_level_aggregation is only supported when "
+            "route_execution_mode='parallel'"
+        ),
+    ):
+        TopoTune(
+            GNN=MockGNN(16, 32, 16),
+            neighborhoods=OmegaConf.create(
+                ["up_adjacency-0", "down_incidence-1"]
+            ),
+            layers=1,
+            use_edge_attr=False,
+            activation="relu",
+            inter_level_aggregation=PyGAggregationAdapter(
+                SumAggregation()
+            ),
+            route_execution_mode="sequential",
+        )
+
+
+def test_topotune_hydra_instantiation_with_sequential_routes():
+    """Hydra should expose the sequential route execution mode."""
+    overrides = [
+        "dataset=graph/MUTAG",
+        "model=combinatorial/topotune",
+        "transforms=no_transform",
+        "++model.backbone.route_execution_mode=sequential",
+    ]
+    config_dir = str(ROOT / "configs")
+    with hydra.initialize_config_dir(
+        version_base="1.3",
+        config_dir=config_dir,
+        job_name="test_topotune_sequential_route_hydra",
+    ):
+        cfg = hydra.compose(config_name="run.yaml", overrides=overrides)
+        backbone = hydra.utils.instantiate(cfg.model.backbone)
+
+    assert backbone.route_execution_mode == "sequential"

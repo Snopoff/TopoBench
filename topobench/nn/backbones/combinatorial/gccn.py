@@ -1,6 +1,7 @@
 """Define the TopoTune class, which, given a choice of hyperparameters, instantiates a GCCN expecting a collection of strictly augmented Hasse graphs as input."""
 
 import copy
+from typing import Literal
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +33,10 @@ class TopoTune(torch.nn.Module):
     inter_level_aggregation : torch.nn.Module or None, optional
         Inter-level aggregation module applied per destination rank. If
         ``None``, TopoTune uses the legacy rank-wise sum path.
+    route_execution_mode : {"parallel", "sequential"}, optional
+        Controls whether routes in each TopoTune layer are evaluated all at
+        once and aggregated by destination rank, or applied one after another
+        with immediate write-back to the batch embeddings.
     """
 
     def __init__(
@@ -43,6 +48,7 @@ class TopoTune(torch.nn.Module):
         activation,
         rank_to_propagate: int | None = None,
         inter_level_aggregation: torch.nn.Module | None = None,
+        route_execution_mode: Literal["parallel", "sequential"] = "parallel",
     ):
         super().__init__()
         self.routes = get_routes_from_neighborhoods(neighborhoods)
@@ -50,6 +56,20 @@ class TopoTune(torch.nn.Module):
         self.layers = layers
         self.use_edge_attr = use_edge_attr
         self.inter_level_aggregation = inter_level_aggregation
+
+        if route_execution_mode not in {"parallel", "sequential"}:
+            raise ValueError(
+                "route_execution_mode must be either 'parallel' or 'sequential'."
+            )
+        if (
+            route_execution_mode == "sequential"
+            and inter_level_aggregation is not None
+        ):
+            raise ValueError(
+                "inter_level_aggregation is only supported when route_execution_mode='parallel'."
+            )
+        self.route_execution_mode = route_execution_mode
+
         routes_max_rank = max([max(route) for route in self.routes])
         self.max_rank = (
             routes_max_rank
@@ -117,18 +137,21 @@ class TopoTune(torch.nn.Module):
             ]
         )
 
-    def get_nbhd_cache(self, params):
+    def get_nbhd_cache(
+        self, batch: Data
+    ) -> dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]:
         """Cache the nbhd information into a dict for the complex at hand.
 
         Parameters
         ----------
-        params : dict
-            The parameters of the batch, containing the complex.
+        batch : torch_geometric.data.Data
+            The batch object containing the complexes.
 
         Returns
         -------
-        dict
+        dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
             The neighborhood cache.
+            Keys are (src_rank, dst_rank) tuples and values are the corresponding (edge_index, edge_attr) tuples needed for inter-rank expansions.
         """
         nbhd_cache = {}
         for neighborhood, route in zip(
@@ -136,34 +159,34 @@ class TopoTune(torch.nn.Module):
         ):
             src_rank, dst_rank = route
             if src_rank != dst_rank and (src_rank, dst_rank) not in nbhd_cache:
-                n_dst_nodes = getattr(params, f"x_{dst_rank}").shape[0]
+                n_dst_nodes = getattr(batch, f"x_{dst_rank}").shape[0]
                 if src_rank > dst_rank:
-                    boundary = getattr(params, neighborhood).coalesce()
+                    boundary = getattr(batch, neighborhood).coalesce()
                     nbhd_cache[(src_rank, dst_rank)] = (
                         interrank_boundary_index(
-                            getattr(params, f"x_{src_rank}"),
+                            getattr(batch, f"x_{src_rank}"),
                             boundary.indices(),
                             n_dst_nodes,
                         )
                     )
                 elif src_rank < dst_rank:
-                    coboundary = getattr(params, neighborhood).coalesce()
+                    coboundary = getattr(batch, neighborhood).coalesce()
                     nbhd_cache[(src_rank, dst_rank)] = (
                         interrank_boundary_index(
-                            getattr(params, f"x_{src_rank}"),
+                            getattr(batch, f"x_{src_rank}"),
                             coboundary.indices(),
                             n_dst_nodes,
                         )
                     )
         return nbhd_cache
 
-    def intrarank_expand(self, params, src_rank, nbhd):
+    def intrarank_expand(self, batch: Data, src_rank: int, nbhd: str) -> Data:
         """Expand the complex into an intrarank Hasse graph.
 
         Parameters
         ----------
-        params : dict
-            The parameters of the batch, containting the complex.
+        batch : torch_geometric.data.Data
+            The batch object containing the complex.
         src_rank : int
             The source rank.
         nbhd : str
@@ -175,10 +198,10 @@ class TopoTune(torch.nn.Module):
             The expanded batch of intrarank Hasse graphs for this route.
         """
         batch_route = Data(
-            x=getattr(params, f"x_{src_rank}"),
-            edge_index=getattr(params, nbhd).indices(),
-            edge_weight=getattr(params, nbhd).values().squeeze(),
-            edge_attr=getattr(params, nbhd).values().squeeze(),
+            x=getattr(batch, f"x_{src_rank}"),
+            edge_index=getattr(batch, nbhd).indices(),
+            edge_weight=getattr(batch, nbhd).values().squeeze(),
+            edge_attr=getattr(batch, nbhd).values().squeeze(),
             requires_grad=True,
         )
 
@@ -212,22 +235,31 @@ class TopoTune(torch.nn.Module):
         return out
 
     def interrank_expand(
-        self, params, src_rank, dst_rank, nbhd_cache, membership
+        self,
+        batch: Data,
+        src_rank: int,
+        dst_rank: int,
+        nbhd_cache: tuple[torch.Tensor, torch.Tensor],
+        membership: dict[int, torch.Tensor],
+        use_current_dst: bool = False,
     ):
         """Expand the complex into an interrank Hasse graph.
 
         Parameters
         ----------
-        params : dict
-            The parameters of the batch, containting the complex.
+        batch : torch_geometric.data.Data
+            The batch object containing the complex.
         src_rank : int
             The source rank.
         dst_rank : int
             The destination rank.
-        nbhd_cache : dict
+        nbhd_cache : tuple[torch.Tensor, torch.Tensor]
             The neighborhood cache containing the expanded boundary index and edge attributes.
         membership : dict
             The batch membership of the graphs per rank.
+        use_current_dst : bool, optional
+            Whether to seed the destination slice with the current destination embeddings instead of zeros.
+            This is used by sequential route execution for later routes to consume earlier updates.
 
         Returns
         -------
@@ -237,9 +269,13 @@ class TopoTune(torch.nn.Module):
         src_batch = membership[src_rank]
         dst_batch = membership[dst_rank]
         edge_index, edge_attr = nbhd_cache
-        device = getattr(params, f"x_{src_rank}").device
-        feat_on_dst = torch.zeros_like(getattr(params, f"x_{dst_rank}"))
-        x_in = torch.vstack([feat_on_dst, getattr(params, f"x_{src_rank}")])
+        device = getattr(batch, f"x_{src_rank}").device
+        feat_on_dst = (
+            getattr(batch, f"x_{dst_rank}")
+            if use_current_dst
+            else torch.zeros_like(getattr(batch, f"x_{dst_rank}"))
+        )
+        x_in = torch.vstack([feat_on_dst, getattr(batch, f"x_{src_rank}")])
         batch_expanded = torch.cat([dst_batch, src_batch], dim=0)
 
         batch_route = Data(
@@ -355,7 +391,7 @@ class TopoTune(torch.nn.Module):
         """
         inter_level_aggregation = self.inter_level_aggregation_layers[
             layer_idx
-        ]
+        ]  # type: ignore
         rank_sequences = self._build_rank_sequences(x_out_per_route)
         x_out_per_rank = {}
 
@@ -410,6 +446,148 @@ class TopoTune(torch.nn.Module):
             )
         return self._aggregate_inter_nbhd_module(x_out_per_route, layer_idx)
 
+    def _execute_route(
+        self,
+        batch: Data,
+        membership: dict[int, torch.Tensor],
+        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        layer_idx: int,
+        route_index: int,
+        use_current_dst: bool = False,
+    ) -> tuple[int, torch.Tensor]:
+        """Execute a single route on the current batch state.
+
+        Parameters
+        ----------
+        batch : torch_geometric.data.Data
+            Batch object containing the current cell embeddings.
+        membership : dict[int, torch.Tensor]
+            Batch membership vectors keyed by rank.
+        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
+            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        layer_idx : int
+            Index of the TopoTune layer being executed.
+        route_index : int
+            Route index in ``self.routes`` / ``self.neighborhoods``.
+        use_current_dst : bool, optional
+            Whether an inter-rank expansion should expose the current
+            destination embeddings to the route.
+
+        Returns
+        -------
+        tuple[int, torch.Tensor]
+            The destination rank and the route output tensor.
+        """
+        src_rank, dst_rank = self.routes[route_index]
+
+        if src_rank == dst_rank:
+            """
+            If `src_rank == dst_rank`, then this route is an intrarank route (e.g. node-to-node).
+            In this case, we can directly build the intrarank Hasse graph batch and execute the GNN without needing to consult the nbhd_cache or membership.
+            """
+            nbhd = self.neighborhoods[route_index]
+            batch_route = self.intrarank_expand(batch, src_rank, nbhd)
+            x_out = self.intrarank_gnn_forward(
+                batch_route, layer_idx, route_index
+            )
+            return dst_rank, x_out
+
+        """
+        When `src_rank != dst_rank`, then this route is an interrank route (e.g. edge-to-node).
+        In this case, we need to consult the nbhd_cache to build the interrank Hasse graph batch with the correct edge_index and edge_attr,
+        and we need to consult the membership to correctly align the source and destination node features in the expanded batch.
+        """
+        nbhd = nbhd_cache[(src_rank, dst_rank)]
+        batch_route = self.interrank_expand(
+            batch,
+            src_rank,
+            dst_rank,
+            nbhd,
+            membership,
+            use_current_dst=use_current_dst,
+        )
+        x_out = self.interrank_gnn_forward(
+            batch_route,
+            layer_idx,
+            route_index,
+            getattr(batch, f"x_{dst_rank}").shape[0],
+        )
+        return dst_rank, x_out
+
+    def _forward_parallel_layer(
+        self,
+        batch: Data,
+        membership: dict[int, torch.Tensor],
+        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        layer_idx: int,
+        act,
+    ) -> None:
+        """Execute one TopoTune layer with the legacy parallel route semantics.
+
+        Parameters
+        ----------
+        batch : torch_geometric.data.Data
+            Batch object containing the current cell embeddings.
+        membership : dict[int, torch.Tensor]
+            Batch membership vectors keyed by rank.
+        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
+            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        layer_idx : int
+            Index of the TopoTune layer being executed.
+        act : function
+            The activation function to apply to the output features.
+        """
+        x_out_per_route = {}
+        for route_index, _ in enumerate(self.routes):
+            _, x_out = self._execute_route(
+                batch,
+                membership,
+                nbhd_cache,
+                layer_idx,
+                route_index,
+            )
+            x_out_per_route[route_index] = x_out
+
+        x_out_per_rank = self.aggregate_inter_nbhd(
+            x_out_per_route, layer_idx=layer_idx
+        )
+        for rank, x_out in x_out_per_rank.items():
+            setattr(batch, f"x_{rank}", act(x_out))
+
+    def _forward_sequential_layer(
+        self,
+        batch: Data,
+        membership: dict[int, torch.Tensor],
+        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        layer_idx: int,
+        act,
+    ) -> None:
+        """Execute one TopoTune layer with ordered in-place route updates.
+
+        Parameters
+        ----------
+        batch : torch_geometric.data.Data
+            Batch object containing the current cell embeddings.
+        membership : dict[int, torch.Tensor]
+            Batch membership vectors keyed by rank.
+        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
+            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        layer_idx : int
+            Index of the TopoTune layer being executed.
+        act : function
+            The activation function to apply to the output features.
+        """
+        for route_index, _ in enumerate(self.routes):
+            dst_rank, x_out = self._execute_route(
+                batch,
+                membership,
+                nbhd_cache,
+                layer_idx,
+                route_index,
+                use_current_dst=True,
+            )
+            setattr(batch, f"x_{dst_rank}", act(x_out))
+
     def generate_membership_vectors(self, batch: Data):
         """Generate membership vectors based on batch.cell_statistics.
 
@@ -439,7 +617,7 @@ class TopoTune(torch.nn.Module):
         }
         return membership
 
-    def forward(self, batch):
+    def forward(self, batch: Data) -> dict[int, torch.Tensor]:
         """Forward pass of the model.
 
         Parameters
@@ -457,50 +635,28 @@ class TopoTune(torch.nn.Module):
         nbhd_cache = self.get_nbhd_cache(batch)
         membership = self.generate_membership_vectors(batch)
 
-        x_out_per_route = {}
         for layer_idx in range(self.layers):
-            for route_index, route in enumerate(self.routes):
-                src_rank, dst_rank = route
+            if self.route_execution_mode == "parallel":
+                self._forward_parallel_layer(
+                    batch,
+                    membership,
+                    nbhd_cache,
+                    layer_idx,
+                    act,
+                )
+            else:
+                self._forward_sequential_layer(
+                    batch,
+                    membership,
+                    nbhd_cache,
+                    layer_idx,
+                    act,
+                )
 
-                if src_rank == dst_rank:
-                    nbhd = self.neighborhoods[route_index]
-                    batch_route = self.intrarank_expand(batch, src_rank, nbhd)
-                    x_out = self.intrarank_gnn_forward(
-                        batch_route, layer_idx, route_index
-                    )
-
-                    x_out_per_route[route_index] = x_out
-
-                elif src_rank != dst_rank:
-                    nbhd = nbhd_cache[(src_rank, dst_rank)]
-
-                    batch_route = self.interrank_expand(
-                        batch, src_rank, dst_rank, nbhd, membership
-                    )
-                    x_out = self.interrank_gnn_forward(
-                        batch_route,
-                        layer_idx,
-                        route_index,
-                        getattr(batch, f"x_{dst_rank}").shape[0],
-                    )
-
-                    x_out_per_route[route_index] = x_out
-
-            # aggregate across neighborhoods
-            x_out_per_rank = self.aggregate_inter_nbhd(
-                x_out_per_route, layer_idx=layer_idx
-            )
-
-            # update and replace the features for next layer
-            for rank in x_out_per_rank:
-                x_out_per_rank[rank] = act(x_out_per_rank[rank])
-                setattr(batch, f"x_{rank}", x_out_per_rank[rank])
-
-        for rank in range(self.max_rank + 1):
-            if rank not in x_out_per_rank:
-                x_out_per_rank[rank] = getattr(batch, f"x_{rank}")
-
-        return x_out_per_rank
+        return {
+            rank: getattr(batch, f"x_{rank}")
+            for rank in range(self.max_rank + 1)
+        }
 
 
 def interrank_boundary_index(x_src, boundary_index, n_dst_nodes):

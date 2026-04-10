@@ -34,6 +34,7 @@ backbone:
   layers: 2
   use_edge_attr: false
   activation: relu
+  route_execution_mode: parallel # Options: parallel, sequential
   inter_level_aggregation: ${model.inter_level_aggregation}
 
 backbone_wrapper:
