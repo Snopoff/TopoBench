@@ -37,6 +37,13 @@ class TopoTune(torch.nn.Module):
         Controls whether routes in each TopoTune layer are evaluated all at
         once and aggregated by destination rank, or applied one after another
         with immediate write-back to the batch embeddings.
+    ordered_neighborhoods : list[str] or None, optional
+        Subset of ``neighborhoods`` that should use an order-sensitive route
+        model instead of the default route GNN.
+    ordered_neighborhood_model : torch.nn.Module or None, optional
+        Instantiated order-sensitive route model to deep-copy for ordered
+        neighborhoods. This is expected to follow the PyG aggregation-style
+        signature ``forward(x, index=..., dim=..., dim_size=...)``.
     """
 
     def __init__(
@@ -49,6 +56,8 @@ class TopoTune(torch.nn.Module):
         rank_to_propagate: int | None = None,
         inter_level_aggregation: torch.nn.Module | None = None,
         route_execution_mode: Literal["parallel", "sequential"] = "parallel",
+        ordered_neighborhoods: list[str] | None = None,
+        ordered_neighborhood_model: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.routes = get_routes_from_neighborhoods(neighborhoods)
@@ -56,6 +65,13 @@ class TopoTune(torch.nn.Module):
         self.layers = layers
         self.use_edge_attr = use_edge_attr
         self.inter_level_aggregation = inter_level_aggregation
+        self.ordered_neighborhoods = (
+            list(ordered_neighborhoods)
+            if ordered_neighborhoods is not None
+            else []
+        )
+        self.ordered_neighborhoods_set = set(self.ordered_neighborhoods)
+        self.ordered_neighborhood_model = ordered_neighborhood_model
 
         if route_execution_mode not in {"parallel", "sequential"}:
             raise ValueError(
@@ -69,6 +85,9 @@ class TopoTune(torch.nn.Module):
                 "inter_level_aggregation is only supported when route_execution_mode='parallel'."
             )
         self.route_execution_mode = route_execution_mode
+        self.hidden_channels = GNN.hidden_channels
+        self.out_channels = GNN.out_channels
+        self._validate_ordered_neighborhoods()
 
         routes_max_rank = max([max(route) for route in self.routes])
         self.max_rank = (
@@ -76,20 +95,12 @@ class TopoTune(torch.nn.Module):
             if rank_to_propagate is None
             else max(routes_max_rank, rank_to_propagate)
         )
-        self.graph_routes = torch.nn.ModuleList()
-        self.GNN = [i for i in GNN.named_modules()]
+        self.route_modules = self._build_route_modules(
+            GNN, ordered_neighborhood_model
+        )
         self.activation = activation
         self.route_indices_by_dst_rank = self._get_route_indices_by_dst_rank()
-        # Instantiate GNN layers
-        num_routes = len(self.routes)
-        for _ in range(self.layers):
-            layer_routes = torch.nn.ModuleList()
-            for _ in range(num_routes):
-                layer_routes.append(copy.deepcopy(GNN))
-            self.graph_routes.append(layer_routes)
 
-        self.hidden_channels = GNN.hidden_channels
-        self.out_channels = GNN.out_channels
         self.inter_level_aggregation_layers = (
             self._build_inter_level_aggregation_layers()
         )
@@ -109,6 +120,23 @@ class TopoTune(torch.nn.Module):
                 route_index
             )
         return route_indices_by_dst_rank
+
+    def _is_ordered_route(self, route_index: int) -> bool:
+        """Check whether a route should use the ordered route model.
+
+        Parameters
+        ----------
+        route_index : int
+            Route index in ``self.routes`` / ``self.neighborhoods``.
+
+        Returns
+        -------
+        bool
+            Whether the route is configured as ordered.
+        """
+        return (
+            self.neighborhoods[route_index] in self.ordered_neighborhoods_set
+        )
 
     def _build_inter_level_aggregation_layers(
         self,
@@ -137,10 +165,85 @@ class TopoTune(torch.nn.Module):
             ]
         )
 
-    def get_nbhd_cache(
+    def _validate_ordered_neighborhoods(self) -> None:
+        """Validate the ordered-neighborhood configuration."""
+        ordered_neighborhoods = self.ordered_neighborhoods_set
+        if not ordered_neighborhoods:
+            return
+
+        missing_neighborhoods = ordered_neighborhoods.difference(
+            self.neighborhoods
+        )
+        if missing_neighborhoods:
+            raise ValueError(
+                f"ordered_neighborhoods must be a subset of neighborhoods. Missing: {sorted(missing_neighborhoods)}."
+            )
+
+        if self.ordered_neighborhood_model is None:
+            raise ValueError(
+                "ordered_neighborhood_model must be provided when ordered_neighborhoods is not empty."
+            )
+        if not isinstance(self.ordered_neighborhood_model, torch.nn.Module):
+            raise TypeError(
+                "ordered_neighborhood_model must be an instantiated torch.nn.Module."
+            )
+        if not hasattr(self.ordered_neighborhood_model, "out_channels"):
+            raise ValueError(
+                "ordered_neighborhood_model must expose an out_channels attribute."
+            )
+        if self.ordered_neighborhood_model.out_channels != self.out_channels:
+            raise ValueError(
+                "ordered_neighborhood_model.out_channels must match GNN.out_channels."
+            )
+
+        for neighborhood, route in zip(
+            self.neighborhoods, self.routes, strict=False
+        ):
+            if neighborhood not in ordered_neighborhoods:
+                continue
+            src_rank, dst_rank = route
+            if src_rank == dst_rank or "incidence" not in neighborhood:
+                raise ValueError(
+                    f"Only inter-rank incidence neighborhoods can be marked ordered, but received {neighborhood}."
+                )
+
+    def _build_route_modules(
+        self,
+        GNN: torch.nn.Module,
+        ordered_neighborhood_model: torch.nn.Module | None,
+    ) -> torch.nn.ModuleList:
+        """Instantiate one route module per route per TopoTune layer.
+
+        Parameters
+        ----------
+        GNN : torch.nn.Module
+            Default unordered route model.
+        ordered_neighborhood_model : torch.nn.Module or None
+            Default ordered route model.
+
+        Returns
+        -------
+        torch.nn.ModuleList
+            Nested module list indexed as ``[layer_idx][route_index]``.
+        """
+        route_modules = torch.nn.ModuleList()
+        num_routes = len(self.routes)
+        for _ in range(self.layers):
+            layer_routes = torch.nn.ModuleList()
+            for route_index in range(num_routes):
+                if self._is_ordered_route(route_index):
+                    layer_routes.append(
+                        copy.deepcopy(ordered_neighborhood_model)
+                    )
+                else:
+                    layer_routes.append(copy.deepcopy(GNN))
+            route_modules.append(layer_routes)
+        return route_modules
+
+    def get_route_cache(
         self, batch: Data
-    ) -> dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]:
-        """Cache the nbhd information into a dict for the complex at hand.
+    ) -> dict[int, dict[str, torch.Tensor | str]]:
+        """Cache per-route tensors needed during the current forward pass.
 
         Parameters
         ----------
@@ -149,36 +252,64 @@ class TopoTune(torch.nn.Module):
 
         Returns
         -------
-        dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
-            The neighborhood cache.
-            Keys are (src_rank, dst_rank) tuples and values are the corresponding (edge_index, edge_attr) tuples needed for inter-rank expansions.
+        dict[int, dict[str, torch.Tensor | str]]
+            Mapping from route index to the cached tensors required by that
+            route. Ordered routes cache grouped source indices, while
+            unordered inter-rank routes cache expanded lifted-graph tensors.
         """
-        nbhd_cache = {}
-        for neighborhood, route in zip(
-            self.neighborhoods, self.routes, strict=False
+        route_cache: dict[int, dict[str, torch.Tensor | str]] = {}
+        for route_index, (neighborhood, route) in enumerate(
+            zip(self.neighborhoods, self.routes, strict=False)
         ):
             src_rank, dst_rank = route
-            if src_rank != dst_rank and (src_rank, dst_rank) not in nbhd_cache:
-                n_dst_nodes = getattr(batch, f"x_{dst_rank}").shape[0]
-                if src_rank > dst_rank:
-                    boundary = getattr(batch, neighborhood).coalesce()
-                    nbhd_cache[(src_rank, dst_rank)] = (
-                        interrank_boundary_index(
-                            getattr(batch, f"x_{src_rank}"),
-                            boundary.indices(),
-                            n_dst_nodes,
-                        )
+            if src_rank == dst_rank:
+                continue
+
+            if self._is_ordered_route(route_index):
+                route_connectivity = getattr(batch, neighborhood).coalesce()
+                dst_ids, src_ids = route_connectivity.indices()
+                if dst_ids.numel() == 0:
+                    empty = torch.empty(
+                        0, dtype=torch.long, device=dst_ids.device
                     )
-                elif src_rank < dst_rank:
-                    coboundary = getattr(batch, neighborhood).coalesce()
-                    nbhd_cache[(src_rank, dst_rank)] = (
-                        interrank_boundary_index(
-                            getattr(batch, f"x_{src_rank}"),
-                            coboundary.indices(),
-                            n_dst_nodes,
-                        )
-                    )
-        return nbhd_cache
+                    route_cache[route_index] = {
+                        "kind": "ordered",
+                        "src_ids": empty,
+                        "active_dst_ids": empty,
+                        "index": empty,
+                    }
+                    continue
+
+                active_dst_ids, counts = torch.unique_consecutive(
+                    dst_ids, return_counts=True
+                )
+                index = torch.arange(
+                    active_dst_ids.numel(),
+                    dtype=torch.long,
+                    device=dst_ids.device,
+                ).repeat_interleave(counts)
+                route_cache[route_index] = {
+                    "kind": "ordered",
+                    "src_ids": src_ids,
+                    "active_dst_ids": active_dst_ids,
+                    "index": index,
+                }
+                continue
+
+            n_dst_nodes = getattr(batch, f"x_{dst_rank}").shape[0]
+            route_connectivity = getattr(batch, neighborhood).coalesce()
+            edge_index, edge_attr = interrank_boundary_index(
+                getattr(batch, f"x_{src_rank}"),
+                route_connectivity.indices(),
+                n_dst_nodes,
+            )
+            route_cache[route_index] = {
+                "kind": "unordered_interrank",
+                "edge_index": edge_index,
+                "edge_attr": edge_attr,
+            }
+
+        return route_cache
 
     def intrarank_expand(self, batch: Data, src_rank: int, nbhd: str) -> Data:
         """Expand the complex into an intrarank Hasse graph.
@@ -226,7 +357,7 @@ class TopoTune(torch.nn.Module):
         """
         if batch_route.x.shape[0] < 2:
             return batch_route.x
-        out = self.graph_routes[layer_idx][route_index](
+        out = self.route_modules[layer_idx][route_index](
             batch_route.x,
             batch_route.edge_index,
             #    batch_route.edge_weight, # TODO Mathilde : some gnns take edge_weight (1d) and some take edge_attr.
@@ -239,7 +370,7 @@ class TopoTune(torch.nn.Module):
         batch: Data,
         src_rank: int,
         dst_rank: int,
-        nbhd_cache: tuple[torch.Tensor, torch.Tensor],
+        route_cache_entry: dict[str, torch.Tensor | str],
         membership: dict[int, torch.Tensor],
         use_current_dst: bool = False,
     ):
@@ -253,8 +384,8 @@ class TopoTune(torch.nn.Module):
             The source rank.
         dst_rank : int
             The destination rank.
-        nbhd_cache : tuple[torch.Tensor, torch.Tensor]
-            The neighborhood cache containing the expanded boundary index and edge attributes.
+        route_cache_entry : dict[str, torch.Tensor | str]
+            Cached tensors for this unordered inter-rank route.
         membership : dict
             The batch membership of the graphs per rank.
         use_current_dst : bool, optional
@@ -268,7 +399,10 @@ class TopoTune(torch.nn.Module):
         """
         src_batch = membership[src_rank]
         dst_batch = membership[dst_rank]
-        edge_index, edge_attr = nbhd_cache
+        edge_index = route_cache_entry["edge_index"]
+        edge_attr = route_cache_entry["edge_attr"]
+        assert isinstance(edge_index, torch.Tensor)
+        assert isinstance(edge_attr, torch.Tensor)
         device = getattr(batch, f"x_{src_rank}").device
         feat_on_dst = (
             getattr(batch, f"x_{dst_rank}")
@@ -309,7 +443,7 @@ class TopoTune(torch.nn.Module):
         torch.tensor
             The output of the GNN (updated features).
         """
-        expanded_out = self.graph_routes[layer_idx][route_index](
+        expanded_out = self.route_modules[layer_idx][route_index](
             batch_route.x,
             batch_route.edge_index,
             #    batch_route.edge_weight, # TODO : some gnns take edge_weight (1d) and some take edge_attr.
@@ -446,16 +580,16 @@ class TopoTune(torch.nn.Module):
             )
         return self._aggregate_inter_nbhd_module(x_out_per_route, layer_idx)
 
-    def _execute_route(
+    def _execute_unordered_route(
         self,
         batch: Data,
         membership: dict[int, torch.Tensor],
-        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        route_cache: dict[int, dict[str, torch.Tensor | str]],
         layer_idx: int,
         route_index: int,
         use_current_dst: bool = False,
     ) -> tuple[int, torch.Tensor]:
-        """Execute a single route on the current batch state.
+        """Execute a single unordered route on the current batch state.
 
         Parameters
         ----------
@@ -463,8 +597,8 @@ class TopoTune(torch.nn.Module):
             Batch object containing the current cell embeddings.
         membership : dict[int, torch.Tensor]
             Batch membership vectors keyed by rank.
-        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
-            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        route_cache : dict[int, dict[str, torch.Tensor | str]]
+            Cached per-route tensors keyed by route index.
         layer_idx : int
             Index of the TopoTune layer being executed.
         route_index : int
@@ -481,10 +615,6 @@ class TopoTune(torch.nn.Module):
         src_rank, dst_rank = self.routes[route_index]
 
         if src_rank == dst_rank:
-            """
-            If `src_rank == dst_rank`, then this route is an intrarank route (e.g. node-to-node).
-            In this case, we can directly build the intrarank Hasse graph batch and execute the GNN without needing to consult the nbhd_cache or membership.
-            """
             nbhd = self.neighborhoods[route_index]
             batch_route = self.intrarank_expand(batch, src_rank, nbhd)
             x_out = self.intrarank_gnn_forward(
@@ -492,17 +622,12 @@ class TopoTune(torch.nn.Module):
             )
             return dst_rank, x_out
 
-        """
-        When `src_rank != dst_rank`, then this route is an interrank route (e.g. edge-to-node).
-        In this case, we need to consult the nbhd_cache to build the interrank Hasse graph batch with the correct edge_index and edge_attr,
-        and we need to consult the membership to correctly align the source and destination node features in the expanded batch.
-        """
-        nbhd = nbhd_cache[(src_rank, dst_rank)]
+        route_cache_entry = route_cache[route_index]
         batch_route = self.interrank_expand(
             batch,
             src_rank,
             dst_rank,
-            nbhd,
+            route_cache_entry,
             membership,
             use_current_dst=use_current_dst,
         )
@@ -514,11 +639,126 @@ class TopoTune(torch.nn.Module):
         )
         return dst_rank, x_out
 
+    def _execute_ordered_route(
+        self,
+        batch: Data,
+        route_cache: dict[int, dict[str, torch.Tensor | str]],
+        layer_idx: int,
+        route_index: int,
+    ) -> tuple[int, torch.Tensor]:
+        """Execute a single ordered route on the current batch state.
+
+        Parameters
+        ----------
+        batch : torch_geometric.data.Data
+            Batch object containing the current cell embeddings.
+        route_cache : dict[int, dict[str, torch.Tensor | str]]
+            Cached per-route tensors keyed by route index.
+        layer_idx : int
+            Index of the TopoTune layer being executed.
+        route_index : int
+            Route index in ``self.routes`` / ``self.neighborhoods``.
+
+        Returns
+        -------
+        tuple[int, torch.Tensor]
+            The destination rank and the ordered route output tensor.
+        """
+        src_rank, dst_rank = self.routes[route_index]
+        route_cache_entry = route_cache[route_index]
+        src_ids = route_cache_entry["src_ids"]
+        active_dst_ids = route_cache_entry["active_dst_ids"]
+        index = route_cache_entry["index"]
+        assert isinstance(src_ids, torch.Tensor)
+        assert isinstance(active_dst_ids, torch.Tensor)
+        assert isinstance(index, torch.Tensor)
+        x_src = getattr(batch, f"x_{src_rank}")
+        n_dst_cells = getattr(batch, f"x_{dst_rank}").shape[0]
+        src_ids = src_ids.to(x_src.device)
+        active_dst_ids = active_dst_ids.to(x_src.device)
+        index = index.to(x_src.device)
+
+        x_out = torch.zeros(
+            (n_dst_cells, self.out_channels),
+            dtype=x_src.dtype,
+            device=x_src.device,
+        )
+        if src_ids.numel() == 0:
+            return dst_rank, x_out
+
+        route_out = self.route_modules[layer_idx][route_index](
+            x_src[src_ids],
+            index=index,
+            dim=0,
+            dim_size=active_dst_ids.numel(),
+        )
+        if route_out.ndim != 2:
+            raise ValueError(
+                "ordered_neighborhood_model must return a tensor with shape [num_active_destinations, out_channels]."
+            )
+        if route_out.shape != (active_dst_ids.numel(), self.out_channels):
+            raise ValueError(
+                "ordered_neighborhood_model must return one output per "
+                "active destination and preserve out_channels. "
+                f"Expected {(active_dst_ids.numel(), self.out_channels)}, "
+                f"received {tuple(route_out.shape)}."
+            )
+        x_out[active_dst_ids] = route_out
+        return dst_rank, x_out
+
+    def _execute_route(
+        self,
+        batch: Data,
+        membership: dict[int, torch.Tensor],
+        route_cache: dict[int, dict[str, torch.Tensor | str]],
+        layer_idx: int,
+        route_index: int,
+        use_current_dst: bool = False,
+    ) -> tuple[int, torch.Tensor]:
+        """Execute a single route on the current batch state.
+
+        Parameters
+        ----------
+        batch : torch_geometric.data.Data
+            Batch object containing the current cell embeddings.
+        membership : dict[int, torch.Tensor]
+            Batch membership vectors keyed by rank.
+        route_cache : dict[int, dict[str, torch.Tensor | str]]
+            Cached per-route tensors keyed by route index.
+        layer_idx : int
+            Index of the TopoTune layer being executed.
+        route_index : int
+            Route index in ``self.routes`` / ``self.neighborhoods``.
+        use_current_dst : bool, optional
+            Whether an unordered inter-rank expansion should expose the
+            current destination embeddings to the route.
+
+        Returns
+        -------
+        tuple[int, torch.Tensor]
+            The destination rank and the route output tensor.
+        """
+        if self._is_ordered_route(route_index):
+            return self._execute_ordered_route(
+                batch,
+                route_cache,
+                layer_idx,
+                route_index,
+            )
+        return self._execute_unordered_route(
+            batch,
+            membership,
+            route_cache,
+            layer_idx,
+            route_index,
+            use_current_dst=use_current_dst,
+        )
+
     def _forward_parallel_layer(
         self,
         batch: Data,
         membership: dict[int, torch.Tensor],
-        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        route_cache: dict[int, dict[str, torch.Tensor | str]],
         layer_idx: int,
         act,
     ) -> None:
@@ -530,8 +770,8 @@ class TopoTune(torch.nn.Module):
             Batch object containing the current cell embeddings.
         membership : dict[int, torch.Tensor]
             Batch membership vectors keyed by rank.
-        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
-            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        route_cache : dict[int, dict[str, torch.Tensor | str]]
+            Cached per-route tensors keyed by route index.
         layer_idx : int
             Index of the TopoTune layer being executed.
         act : function
@@ -542,7 +782,7 @@ class TopoTune(torch.nn.Module):
             _, x_out = self._execute_route(
                 batch,
                 membership,
-                nbhd_cache,
+                route_cache,
                 layer_idx,
                 route_index,
             )
@@ -558,7 +798,7 @@ class TopoTune(torch.nn.Module):
         self,
         batch: Data,
         membership: dict[int, torch.Tensor],
-        nbhd_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]],
+        route_cache: dict[int, dict[str, torch.Tensor | str]],
         layer_idx: int,
         act,
     ) -> None:
@@ -570,8 +810,8 @@ class TopoTune(torch.nn.Module):
             Batch object containing the current cell embeddings.
         membership : dict[int, torch.Tensor]
             Batch membership vectors keyed by rank.
-        nbhd_cache : dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]]
-            Cached inter-rank expansion data keyed by ``(src_rank, dst_rank)``.
+        route_cache : dict[int, dict[str, torch.Tensor | str]]
+            Cached per-route tensors keyed by route index.
         layer_idx : int
             Index of the TopoTune layer being executed.
         act : function
@@ -581,7 +821,7 @@ class TopoTune(torch.nn.Module):
             dst_rank, x_out = self._execute_route(
                 batch,
                 membership,
-                nbhd_cache,
+                route_cache,
                 layer_idx,
                 route_index,
                 use_current_dst=True,
@@ -632,7 +872,7 @@ class TopoTune(torch.nn.Module):
         """
         act = get_activation(self.activation)
 
-        nbhd_cache = self.get_nbhd_cache(batch)
+        route_cache = self.get_route_cache(batch)
         membership = self.generate_membership_vectors(batch)
 
         for layer_idx in range(self.layers):
@@ -640,7 +880,7 @@ class TopoTune(torch.nn.Module):
                 self._forward_parallel_layer(
                     batch,
                     membership,
-                    nbhd_cache,
+                    route_cache,
                     layer_idx,
                     act,
                 )
@@ -648,7 +888,7 @@ class TopoTune(torch.nn.Module):
                 self._forward_sequential_layer(
                     batch,
                     membership,
-                    nbhd_cache,
+                    route_cache,
                     layer_idx,
                     act,
                 )

@@ -35,6 +35,8 @@ backbone:
   use_edge_attr: false
   activation: relu
   route_execution_mode: parallel
+  ordered_neighborhoods: []
+  ordered_neighborhood_model: null
   inter_level_aggregation: ${model.inter_level_aggregation}
 
 backbone_wrapper:

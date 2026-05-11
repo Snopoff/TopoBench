@@ -33,6 +33,8 @@ backbone:
   use_edge_attr: false
   activation: relu
   route_execution_mode: parallel # Options: parallel, sequential
+  ordered_neighborhoods: []
+  ordered_neighborhood_model: null
   inter_level_aggregation: ${model.inter_level_aggregation}
   rank_to_propagate: ${oc.select:model.readout.rank_to_propagate,null}
 
