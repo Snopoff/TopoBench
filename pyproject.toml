@@ -6,11 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "TopoBench"
 dynamic = ["version"]
 authors = [
-    {name = "Topological Intelligence Team Authors", email = "tlscabinet@gmail.com"}
+    { name = "Topological Intelligence Team Authors", email = "tlscabinet@gmail.com" },
 ]
 readme = "README.md"
 description = "Topological Deep Learning"
-license = {file = "LICENSE.txt"}
+license = { file = "LICENSE.txt" }
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Development Status :: 4 - Beta",
@@ -20,12 +20,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Natural Language :: English",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11"
+    "Programming Language :: Python :: 3.11",
 ]
 # STRICTLY PYTHON 3.11
 requires-python = ">=3.11, <3.12"
 
-dependencies=[
+dependencies = [
     "torch==2.3.0",
     "tqdm",
     "charset-normalizer",
@@ -67,31 +67,21 @@ doc = [
     "nbsphinx",
     "nbsphinx_link",
     "numpydoc",
-    "sphinx>=7.0,<9.0",   # Sphinx 9 is incompatible with the required docutils
-    "docutils<0.21",      # Required for nbsphinx-link
+    "sphinx>=7.0,<9.0",    # Sphinx 9 is incompatible with the required docutils
+    "docutils<0.21",       # Required for nbsphinx-link
     "sphinx_gallery",
     "pydata-sphinx-theme",
-    "myst_parser"
+    "myst_parser",
 ]
-lint = [
-    "pre-commit",
-    "ruff"
-]
-test = [
-    "pytest",
-    "pytest-cov",
-    "coverage",
-    "jupyter",
-    "mypy",
-    "pytest-mock"
-]
+lint = ["pre-commit", "ruff"]
+test = ["pytest", "pytest-cov", "coverage", "jupyter", "mypy", "pytest-mock"]
 
 dev = ["TopoBench[test, lint]"]
 all = ["TopoBench[dev, doc]"]
 
 [project.urls]
-homepage="https://geometric-intelligence.github.io/topobench/index.html"
-repository="https://github.com/geometric-intelligence/TopoBench"
+homepage = "https://geometric-intelligence.github.io/topobench/index.html"
+repository = "https://github.com/geometric-intelligence/TopoBench"
 
 # ==============================================================================
 #  UV CONFIGURATION
@@ -117,10 +107,7 @@ explicit = true
 find-links = ["https://data.pyg.org/whl/torch-2.3.0+cu121.html"]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'darwin' or sys_platform == 'win32'" },
-    { index = "pytorch-cu121", marker = "sys_platform == 'linux'" },
-]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
 
 [tool.uv.extra-build-dependencies]
 torch-cluster = ["torch==2.3.0"]
@@ -147,7 +134,20 @@ line-length = 79
 docstring-code-format = false
 
 [tool.ruff.lint]
-select = ["F", "E", "W", "I", "UP", "B", "PIE", "Q", "RET", "SIM", "NPY", "PERF"]
+select = [
+    "F",
+    "E",
+    "W",
+    "I",
+    "UP",
+    "B",
+    "PIE",
+    "Q",
+    "RET",
+    "SIM",
+    "NPY",
+    "PERF",
+]
 fixable = ["ALL"]
 ignore = ["E501", "RET504", "RET505", "NPY002", "UP038", "W293", "PERF203"]
 
@@ -159,7 +159,7 @@ convention = "numpy"
 "tests/*" = ["D"]
 
 [tool.setuptools.dynamic]
-version = {attr = "topobench.__version__"}
+version = { attr = "topobench.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["topobench", "topobench.*"]
@@ -172,7 +172,13 @@ disable_error_code = ["import-untyped"]
 plugins = "numpy.typing.mypy_plugin"
 
 [[tool.mypy.overrides]]
-module = ["torch_cluster.*","networkx.*","scipy.spatial","scipy.sparse","toponetx.classes.simplicial_complex"]
+module = [
+    "torch_cluster.*",
+    "networkx.*",
+    "scipy.spatial",
+    "scipy.sparse",
+    "toponetx.classes.simplicial_complex",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

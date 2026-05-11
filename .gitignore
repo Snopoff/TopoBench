@@ -199,4 +199,5 @@ wandb/
 # data files
 *.csv
 *.pt
+maga_*/
 uv.lock

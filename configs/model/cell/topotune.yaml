@@ -3,11 +3,12 @@ _target_: topobench.model.TBModel
 model_name: topotune
 model_domain: cell
 tune_gnn: GCN
+inter_level_aggregation: null
 
 feature_encoder:
   _target_: topobench.nn.encoders.${model.feature_encoder.encoder_name}
   encoder_name: AllCellFeatureEncoder
-  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}} 
+  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}}
   out_channels: 32
   proj_dropout: 0.
   selected_dimensions:
@@ -33,6 +34,10 @@ backbone:
   layers: 2
   use_edge_attr: false
   activation: relu
+  route_execution_mode: parallel # Options: parallel, sequential
+  ordered_neighborhoods: []
+  ordered_neighborhood_model: null
+  inter_level_aggregation: ${model.inter_level_aggregation}
 
 backbone_wrapper:
   _target_: topobench.nn.wrappers.combinatorial.TuneWrapper

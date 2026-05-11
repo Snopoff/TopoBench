@@ -7,7 +7,7 @@ tune_gnn: GCN
 feature_encoder:
   _target_: topobench.nn.encoders.${model.feature_encoder.encoder_name}
   encoder_name: AllCellFeatureEncoder
-  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}} 
+  in_channels: ${infer_in_channels:${dataset},${oc.select:transforms,null}}
   out_channels: 32
   proj_dropout: 0.2
   selected_dimensions:
@@ -32,6 +32,10 @@ backbone:
   layers: 1
   use_edge_attr: false
   activation: relu
+  route_execution_mode: parallel # Options: parallel, sequential
+  ordered_neighborhoods: []
+  ordered_neighborhood_model: null
+  inter_level_aggregation: ${model.inter_level_aggregation}
   rank_to_propagate: ${oc.select:model.readout.rank_to_propagate,null}
 
 backbone_wrapper:
@@ -49,7 +53,7 @@ readout:
   out_channels: ${dataset.parameters.num_classes}
   task_level: ${dataset.parameters.task_level}
   pooling_type: sum
-  hierarchical_propagation: false  # Whether to use hierarchical propagation or direct propagation
+  hierarchical_propagation: false # Whether to use hierarchical propagation or direct propagation
   ranks_to_propagate: [] # Ranks to propagate signals down from (only used if hierarchical_propagation is True)
 
 # compile model for faster training with pytorch 2.0

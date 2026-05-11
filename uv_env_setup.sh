@@ -1,4 +1,5 @@
 #!/bin/bash -l
+set -euo pipefail
 
 # ==============================================================================
 # 🛠️  TopoBench Environment Setup Script (Py3.11 + Dynamic CUDA)
@@ -18,6 +19,11 @@ echo "======================================================="
 # Configuration
 # ------------------------------------------------------------------------------
 TORCH_VER="2.3.0"
+
+if [[ "$OSTYPE" == "darwin"* ]] && [[ "$PLATFORM" != "cpu" ]]; then
+    echo "❌ Error: CUDA targets (cu118/cu121) are Linux-only. On macOS use: cpu."
+    exit 1
+fi
 
 if [ "$PLATFORM" == "cpu" ]; then
     TARGET_INDEX="pytorch-cpu"
@@ -49,7 +55,7 @@ else
 fi
 
 echo "✅ Set PyG Links to : ${PYG_URL}"
-echo "✅ Set Torch Index to: ${TARGET_INDEX}"
+echo "✅ Set Torch Index to: ${TARGET_INDEX} (Linux only; macOS/Windows use PyPI)"
 
 # ------------------------------------------------------------------------------
 # Sync
@@ -68,15 +74,38 @@ fi
 # ------------------------------------------------------------------------------
 # Finalize
 # ------------------------------------------------------------------------------
-source .venv/bin/activate
 echo ""
 echo "🔧 Configuring Git Hooks..."
-uv pip install pre-commit
-pre-commit install
+if [[ ! -x ".venv/bin/python" ]]; then
+    echo "❌ Error: .venv/bin/python is missing. The environment is incomplete."
+    echo "   Recreate it with: rm -rf .venv uv.lock && uv sync --python 3.11 --all-extras"
+    exit 1
+fi
+
+# Prefer the console script because some broken installs expose the package but
+# fail with `python -m pre_commit`.
+if [[ -x ".venv/bin/pre-commit" ]]; then
+    .venv/bin/pre-commit --version >/dev/null
+    .venv/bin/pre-commit install --install-hooks
+elif .venv/bin/python -m pre_commit --version >/dev/null 2>&1; then
+    .venv/bin/python -m pre_commit install --install-hooks
+else
+    echo "❌ Error: pre-commit is missing or broken in .venv."
+    echo "   Ensure sync succeeded with lint extras: uv sync --python 3.11 --all-extras"
+    exit 1
+fi
 
 echo ""
+echo "🧪 Verifying Python/Torch runtime..."
+if ! .venv/bin/python -c "import sys; import torch; print(f'✅ Python Ver    : {sys.version.split()[0]}'); print(f'✅ Torch Version : {torch.__version__}'); print(f'✅ CUDA Available: {torch.cuda.is_available()}'); print(f'✅ CUDA Version  : {torch.version.cuda}')"; then
+    echo ""
+    echo "❌ Torch import verification failed."
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "   On macOS, torch should come from PyPI (not the custom PyTorch index)."
+        echo "   Re-run: bash uv_env_setup.sh cpu"
+    fi
+    exit 1
+fi
 echo "======================================================="
 echo "🎉 Setup Complete!"
-echo "======================================================="
-python -c "import sys; import torch; print(f'✅ Python Ver    : {sys.version.split()[0]}'); print(f'✅ Torch Version : {torch.__version__}'); print(f'✅ CUDA Available: {torch.cuda.is_available()}'); print(f'✅ CUDA Version  : {torch.version.cuda}')"
 echo "======================================================="
